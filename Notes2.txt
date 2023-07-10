@@ -1,0 +1,247 @@
+trigger:
+  - master
+
+resources:
+  pipelines:
+    - pipeline: service
+      source: banking-accounts-service
+      branch: master
+      trigger:
+        branches:
+          - master
+    - pipeline: tests
+      source: banking-accounts-tests
+      branch: master
+
+  repositories:
+    - repository: templates
+      ref: "refs/heads/master"
+      type: git
+      name: azure-pipeline-templates
+
+variables:
+  # Standard inputs
+  - group: dsl-commercial-centralus
+  - group: banking-domain
+  - name: boundedContext
+    value: banking
+  - name: resourceName
+    value: accounts
+  - name: replicas
+    value: "2"
+
+  # Convention-based values
+  - name: testServiceName
+    value: "$(resourceName)-service-test"
+  - name: realServiceName
+    value: "$(resourceName)-service"
+  - name: integrationTestPodName
+    value: $(resourceName)-service-integration
+  - name: integrationTestContainerImage
+    value: $(containerRegistry)/digital-nexus/$(boundedContext)/$(resourceName)/functional-test
+  - name: serviceContainerImage
+    value: $(containerRegistry)/digital-nexus/$(boundedContext)/$(resourceName)/service
+
+stages:
+  - stage: check_security_findings_threshold
+    displayName: "Check security findings threshold"
+    jobs:
+      - template: "deploy/job-buildbreaker.yml@templates"
+  - stage: prepare_test_environment
+    displayName: "Prepare test environment"
+    jobs:
+      - template: "build/job-newtestrun.yml@templates"
+        parameters:
+          apigeeUsername: $(apigee_username)
+          apigeePassword: $(apigee_password)
+          apigeeOrganization: $(apigee_organization)
+          apigeeBootstrapApplication: $(apigee_bootstrapApplicationName)
+      - template: deploy/job-k8sbasic.yml@templates
+        parameters:
+          environment: $(environment)
+          namespace: $(boundedContext)
+          serviceName: $(testServiceName)
+          chartOverrides:
+            image:
+              repository: $(serviceContainerImage)
+              tag: $(resources.pipeline.service.sourceCommit)
+            replicaCount: 1
+            env:
+              - name: ASPNETCORE_ENVIRONMENT
+                value: Development
+            autoscaling:
+              enabled: false
+
+  - stage: stubbed_integration_tests
+    displayName: "Run tests against stubs"
+    jobs:
+      - job: tests
+        displayName: "Execute stubbed tests"
+        pool:
+          name: $(agentPool_deploy)
+        steps:
+          - template: "build/task-gettestrun.yml@templates"
+          - template: build/task-test-integration.yml@templates
+            parameters:
+              integrationTestArguments: >-
+                $(boundedContext)-v1-$(resourceName).postman_collection.json
+                -e $(boundedContext)-v1-$(resourceName).Development.postman_environment.json
+                --env-var "endpoint_$(resourceName)=http://$(testServiceName).$(boundedContext).svc.cluster.local:8080"
+                --env-var "endpoint_token=https://prod.api.fiservapps.com/dsl/oauth2/token"
+                --env-var "CLIENT_ID=$(test_run.ClientId)"
+                --env-var "CLIENT_SECRET=$(test_run.ClientSecret)"
+              integrationTestContainerImage: $(integrationTestContainerImage):$(resources.pipeline.tests.sourceCommit)
+              integrationTestPodName: $(integrationTestPodName)
+              kubernetesCluster: $(kubernetesCluster_name)
+              kubernetesResourceGroup: $(kubernetesCluster_resourceGroup)
+              namespace: $(boundedContext)
+              containerRegistry: $(containerRegistry)
+              azureServiceConnection: $(serviceConnection_arm)
+              reportArtifact: "stubbed_integration_tests"
+
+  - stage: deploy_real_service
+    displayName: "Update instance to real services"
+    jobs:
+      - template: deploy/job-k8sbasic.yml@templates
+        parameters:
+          environment: $(environment)
+          namespace: $(boundedContext)
+          serviceName: $(testServiceName)
+          chartOverrides:
+            image:
+              repository: $(serviceContainerImage)
+              tag: $(resources.pipeline.service.sourceCommit)
+            replicaCount: 1
+            env:
+              - name: ASPNETCORE_ENVIRONMENT
+                value: Production
+              - name: COSMOS__ENDPOINTURL
+                value: $(cosmos_endpointUrl)
+              - name: KEYVAULT__ENDPOINTURL
+                value: $(keyVault_endpointUrl)
+              - name: VOLTAGE__ENVIRONMENT
+                value: $(voltage_environment)
+              - name: VOLTAGE__USERNAME
+                value: $(voltage_username)
+            autoscaling:
+              enabled: false
+
+  - stage: real_integration_tests
+    displayName: "Run tests against real services"
+    jobs:
+      - job: integration_tests
+        displayName: "Execute integration tests"
+        pool:
+          name: $(agentPool_deploy)
+        steps:
+          - template: "build/task-gettestrun.yml@templates"
+          - template: build/task-test-integration.yml@templates
+            parameters:
+              integrationTestArguments: >-
+                $(boundedContext)-v1-$(resourceName).postman_collection.json
+                -e $(boundedContext)-v1-$(resourceName).Production.postman_environment.json
+                --env-var "endpoint_$(resourceName)=http://$(testServiceName).$(boundedContext).svc.cluster.local:8080"
+                --env-var "CLIENT_ID=$(test_run.ClientId)"
+                --env-var "CLIENT_SECRET=$(test_run.ClientSecret)"
+                --env-var "dataPop_blobStorageSAS=$(blobStorage_sas)"
+                --env-var "dataPop_blobStorageConnectionString=$(blobStorage_connectionString)"
+              integrationTestContainerImage: $(integrationTestContainerImage):$(resources.pipeline.tests.sourceCommit)
+              integrationTestPodName: $(integrationTestPodName)
+              kubernetesCluster: $(kubernetesCluster_name)
+              kubernetesResourceGroup: $(kubernetesCluster_resourceGroup)
+              namespace: $(boundedContext)
+              containerRegistry: $(containerRegistry)
+              azureServiceConnection: $(serviceConnection_arm)
+              reportArtifact: "real_integration_tests"
+
+  - stage: cleanup_test_service
+    displayName: "Cleanup test service instance"
+    dependsOn:
+      # Depends on prepare_test_environment so we can reference the variable
+      - prepare_test_environment
+      # Depends on real_integration_tests to ensure it still falls in the
+      # correct location dependency-wise
+      - real_integration_tests
+    variables:
+      # This is from the stubbed service deployment stage. The
+      # job-k8sbasic.yml template generates this value.
+      standaloneServiceStarted: $[stageDependencies.prepare_test_environment.basic.outputs['basic.deployment_start.deploymentStarted']]
+      # There's a chicken/egg problem where the variables provided to the
+      # template need to be available before this stage starts. If you try to
+      # send $(standaloneServiceStarted) as a variable to the template, it's
+      # seen as the literal string "$(standaloneServiceStarted)" rather than the
+      # Boolean value it is. Keeping this here for the point at which this is
+      # fixed in pipelines, but always cleaning up after ourselves seems good.
+    condition: always()
+    jobs:
+      - template: deploy/job-k8sbasic.yml@templates
+        parameters:
+          environment: $(environment)
+          namespace: $(boundedContext)
+          serviceName: $(testServiceName)
+          manifestAction: delete
+          chartOverrides:
+            image:
+              repository: $(serviceContainerImage)
+              tag: $(resources.pipeline.service.sourceCommit)
+            autoscaling:
+              enabled: false
+
+  - stage: deploy_to_dev
+    displayName: "Deploy to Kubernetes"
+    dependsOn:
+      - prepare_test_environment
+      - cleanup_test_service
+    variables:
+      clientId: $[stageDependencies.prepare_test_environment.new_test_run.outputs['test_run.ClientId']]
+      clientSecret: $[stageDependencies.prepare_test_environment.new_test_run.outputs['test_run.ClientSecret']]
+    jobs:
+      - template: deploy/job-k8scanary.yml@templates
+        parameters:
+          environment: $(environment)
+          serviceName: $(realServiceName)
+          namespace: $(boundedContext)
+          azureServiceConnection: $(serviceConnection_arm)
+          kubernetesResourceGroup: $(kubernetesCluster_resourceGroup)
+          kubernetesCluster: $(kubernetesCluster_name)
+          baselineAndCanaryReplicas: $(replicas)
+          trafficSplitAnnotations: |
+            istio.trafficsplit.smi-spec.io/gateways=istio-system/nexus-centralus-prod,mesh
+            istio.trafficsplit.smi-spec.io/port=8080
+          chartOverrides:
+            replicaCount: $(replicas)
+            image:
+              repository: $(serviceContainerImage)
+              tag: $(resources.pipeline.service.sourceCommit)
+            env:
+              - name: COSMOS__ENDPOINTURL
+                value: $(cosmos_endpointUrl)
+              - name: KEYVAULT__ENDPOINTURL
+                value: $(keyVault_endpointUrl)
+              - name: VOLTAGE__ENVIRONMENT
+                value: $(voltage_environment)
+              - name: VOLTAGE__USERNAME
+                value: $(voltage_username)
+          loadTestOverrides:
+            service: $(boundedContext)/$(resourceName)
+            image:
+              tag: $(resources.pipeline.tests.sourceCommit)
+            env:
+              - name: CLIENT_ID
+                value: $(clientId)
+              - name: CLIENT_SECRET
+                value: $(clientSecret)
+              - name: K6_DURATION
+                value: 1m
+          loadTestDurationMinutes: 1
+
+  - stage: remove_test_run
+    displayName: "Remove test tenant and application"
+    condition: always()
+    jobs:
+      - template: "build/job-removetestrun.yml@templates"
+        parameters:
+          apigeeUsername: $(apigee_username)
+          apigeePassword: $(apigee_password)
+          apigeeOrganization: $(apigee_organization)
+          apigeeBootstrapApplication: $(apigee_bootstrapApplicationName)
